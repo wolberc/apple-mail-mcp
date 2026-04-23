@@ -385,7 +385,7 @@ def _search_mail_records(
     end iso_datetime
 
     tell application "Mail"
-        with timeout of 180 seconds
+        with timeout of 150 seconds
             try
                 set recordLines to {{}}
                 set offsetRemaining to {offset}
