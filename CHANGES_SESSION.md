@@ -1,7 +1,8 @@
 # Session Changes — Apple Mail MCP
 
-All changes are committed to branch `full_changes` on fork `git@github.com:wolberc/apple-mail-mcp.git`.
-Three files were modified: `plugin/apple_mail_mcp/core.py`, `plugin/apple_mail_mcp/tools/inbox.py`, `plugin/apple_mail_mcp/tools/search.py`.
+Changes are split across two branches on fork `git@github.com:wolberc/apple-mail-mcp.git`:
+- `full_changes`: date filtering, `get_email` tool, MCP attachment resource
+- `fix/timeout-orphan-process`: orphaned-process fix for MCP freeze-on-timeout (built on top of `full_changes`)
 
 ---
 
@@ -63,10 +64,31 @@ Three files were modified: `plugin/apple_mail_mcp/core.py`, `plugin/apple_mail_m
 
 ---
 
+---
+
+## 5. Fix: orphaned `osascript` process freezes entire MCP after timeout
+
+**Problem:** When `body_text` search ran against a large mailbox (~7.7K messages in Sent Items), `subprocess.run` hit its Python-level timeout and raised `TimeoutExpired` — but the underlying `osascript` process was left running. Since Apple Mail's scripting bridge (OSA/Apple Events) is single-threaded, the orphaned process held the event queue. Every subsequent MCP call sent an Apple Event that queued behind the still-running loop, appearing completely frozen (not just slow — indefinitely blocked).
+
+The pattern: works on small mailboxes (~300 msgs) because the body-search loop finishes in time; times out on large ones (~7.7K), and any timeout without killing the process freezes Mail for all future calls.
+
+**Root cause:** `subprocess.run(..., timeout=N)` raises `TimeoutExpired` but Python's own docs state you must call `.kill()` yourself — the child process is not terminated automatically.
+
+**What was done:**
+- Replaced `subprocess.run` with `subprocess.Popen` + `proc.communicate(timeout=N)` in `core.py:run_applescript`.
+- On `TimeoutExpired`: call `proc.kill()` then `proc.communicate()` (to drain pipes) before re-raising. This guarantees `osascript` is dead before returning control to the MCP, freeing Mail's event queue immediately.
+- On any other exception: same kill+drain pattern for safety.
+- AppleScript `with timeout` values staggered to be shorter than the Python kill timeout, so the AppleScript engine exits cleanly first (returning a proper error) rather than being force-killed:
+  - `search.py` body search: AppleScript 150s, Python 180s (was both 180s)
+  - `manage.py` move/update/trash: AppleScript 270s, Python 300s (was both 300s)
+
+---
+
 ## File summary
 
 | File | What changed |
 |------|-------------|
-| `core.py` | Added `MONTH_NAMES`, `build_applescript_date()` (promoted from `search.py`) |
+| `core.py` | Added `MONTH_NAMES`, `build_applescript_date()` (promoted from `search.py`); `run_applescript` now uses `Popen`+`communicate` with `proc.kill()` on timeout |
 | `tools/inbox.py` | `list_inbox_emails`: added `date_from`/`date_to` pre-scan filtering, fixed `account` filter, moved `include_read` to whose-clause; JSON output now includes `message_id`, `internet_message_id`, `mail_link` |
-| `tools/search.py` | Removed local `_build_applescript_date`; added `get_email` tool; added `get_attachment_resource` MCP resource; added `mimetypes` fallback for attachment MIME types; various AppleScript bug fixes |
+| `tools/search.py` | Removed local `_build_applescript_date`; added `get_email` tool; added `get_attachment_resource` MCP resource; added `mimetypes` fallback for attachment MIME types; various AppleScript bug fixes; AppleScript timeout staggered to 150s (Python stays 180s) |
+| `tools/manage.py` | AppleScript `with timeout` staggered to 270s across all operations (Python stays 300s) |
