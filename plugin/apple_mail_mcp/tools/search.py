@@ -1,8 +1,11 @@
 """Search tools: finding and filtering emails."""
 
 import json
+import mimetypes
+import os
 import re
-from typing import Optional, List, Dict, Any
+import tempfile
+from typing import Optional, List, Dict, Any, Union
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
@@ -698,3 +701,423 @@ def get_email_thread(
 
     result = run_applescript(script)
     return result
+
+
+@mcp.tool()
+@inject_preferences
+def get_email(
+    message_id: Optional[Union[str, int]] = None,
+    internet_message_id: Optional[str] = None,
+    account: Optional[str] = None,
+    mailbox: Optional[str] = None,
+) -> str:
+    """
+    Fetch a single email by ID with full details: headers, body, and attachments.
+
+    Provide exactly one of message_id or internet_message_id. Both are returned
+    by search_emails and list_inbox_emails (JSON output).
+
+    Args:
+        message_id: Apple Mail internal numeric ID (fast lookup, from search results).
+        internet_message_id: RFC 2822 Message-ID header, e.g. "<abc@mail.gmail.com>"
+                             (stable across database rebuilds, from search results).
+        account: Optional account name to narrow the search scope (faster when known).
+        mailbox: Optional mailbox name to narrow the search scope (fastest when known).
+                 Defaults to searching all non-system mailboxes. Use "INBOX" for inbox only.
+
+    Returns:
+        JSON with subject, from, to, cc, reply_to, date_received, date_sent, is_read,
+        is_flagged, mailbox, account, message_id, internet_message_id, mail_link,
+        body (full text), and attachments (list of name, size_bytes, mime_type, resource_uri).
+    """
+    # MCP clients often pass numeric IDs as integers — FastMCP/Pydantic rejects
+    # those for a plain Optional[str], so coerce here.
+    if message_id is not None:
+        message_id = str(message_id).strip()
+
+    if not message_id and not internet_message_id:
+        return json.dumps({"error": "Provide message_id or internet_message_id"})
+
+    if message_id:
+        if not message_id.isdigit():
+            return json.dumps({"error": f"message_id must be numeric, got: {message_id!r}"})
+        lookup_condition = f"id is {message_id}"
+    else:
+        escaped_mid = escape_applescript(internet_message_id.strip())
+        lookup_condition = f'message id is "{escaped_mid}"'
+
+    if account:
+        account_setup = f'set searchAccounts to {{account "{escape_applescript(account)}"}}'
+    else:
+        account_setup = "set searchAccounts to every account"
+
+    skip_folders = '{"Trash", "Junk", "Junk Email", "Deleted Items", "Sent", "Sent Items", "Sent Messages", "Drafts", "Spam", "Deleted Messages"}'
+    if mailbox:
+        escaped_mb = escape_applescript(mailbox)
+        mailbox_setup = f'''
+                try
+                    set searchMailboxes to {{mailbox "{escaped_mb}" of targetAccount}}
+                on error
+                    if "{escaped_mb}" is "INBOX" then
+                        set searchMailboxes to {{mailbox "Inbox" of targetAccount}}
+                    else
+                        set searchMailboxes to {{}}
+                    end if
+                end try
+        '''
+        mailbox_loop_open = "repeat with currentMailbox in searchMailboxes"
+        mailbox_loop_skip = ""
+        mailbox_loop_close = "end repeat"
+    else:
+        mailbox_setup = "set searchMailboxes to every mailbox of targetAccount"
+        mailbox_loop_open = f"""
+                    repeat with currentMailbox in searchMailboxes
+                        set mbName to name of currentMailbox
+                        if mbName is in {skip_folders} then
+                        """
+        mailbox_loop_skip = "else"
+        mailbox_loop_close = """
+                        end if
+                    end repeat
+        """
+
+    script = f'''
+    on format_recipients(recipientList)
+        set result to ""
+        repeat with aRecipient in recipientList
+            set rName to name of aRecipient
+            set rAddr to address of aRecipient
+            if length of result > 0 then
+                set result to result & ", "
+            end if
+            if rName is not "" then
+                set result to result & rName & " <" & rAddr & ">"
+            else
+                set result to result & rAddr
+            end if
+        end repeat
+        return result
+    end format_recipients
+
+    on pad2(n)
+        if n < 10 then return "0" & (n as string)
+        return n as string
+    end pad2
+
+    on month_number(m)
+        -- `months` is an AppleScript reserved word (treated as `every month`).
+        set monthValues to {{January, February, March, April, May, June, July, August, September, October, November, December}}
+        repeat with i from 1 to 12
+            if item i of monthValues is m then return i
+        end repeat
+        return 0
+    end month_number
+
+    on iso_datetime(d)
+        set y to year of d as integer
+        set mo to my month_number(month of d)
+        set dy to day of d as integer
+        set h to hours of d
+        set mi to minutes of d
+        set s to seconds of d
+        return (y as string) & "-" & my pad2(mo) & "-" & my pad2(dy) & "T" & my pad2(h) & ":" & my pad2(mi) & ":" & my pad2(s)
+    end iso_datetime
+
+    tell application "Mail"
+        with timeout of 60 seconds
+            set foundMsg to missing value
+            set foundMailboxName to ""
+            set foundAccountName to ""
+            {account_setup}
+
+            repeat with targetAccount in searchAccounts
+                if foundMsg is not missing value then exit repeat
+                {mailbox_setup}
+                {mailbox_loop_open}
+                    {mailbox_loop_skip}
+                    if foundMsg is missing value then
+                        try
+                            set matchingMsgs to every message of currentMailbox whose {lookup_condition}
+                            if (count of matchingMsgs) > 0 then
+                                set foundMsg to item 1 of matchingMsgs
+                                set foundMailboxName to name of currentMailbox
+                                set foundAccountName to name of targetAccount
+                            end if
+                        end try
+                    end if
+                    {mailbox_loop_close}
+            end repeat
+
+            if foundMsg is missing value then
+                return "NOT_FOUND"
+            end if
+
+            set msgNumId to id of foundMsg as string
+            set msgInternetId to ""
+            try
+                set msgInternetId to message id of foundMsg
+            end try
+            set msgSubject to subject of foundMsg
+            set msgSender to sender of foundMsg
+            set msgDateRecv to my iso_datetime(date received of foundMsg)
+            set msgDateSent to ""
+            try
+                set msgDateSent to my iso_datetime(date sent of foundMsg)
+            end try
+            set msgRead to read status of foundMsg as string
+            set msgFlagged to flagged status of foundMsg as string
+            set msgReplyTo to ""
+            try
+                set msgReplyTo to reply to of foundMsg
+            end try
+
+            set msgTo to ""
+            try
+                set msgTo to my format_recipients(to recipients of foundMsg)
+            end try
+            set msgCc to ""
+            try
+                set msgCc to my format_recipients(cc recipients of foundMsg)
+            end try
+
+            set msgBody to ""
+            try
+                set msgBody to content of foundMsg
+            end try
+
+            -- Attachments: one line per attachment.
+            -- Use index-based loop: for-in on Mail attachment collections applies
+            -- the property access to the whole collection, not each item.
+            -- The correct property is `file size`, not `size`.
+            set attachLines to {{}}
+            set realAttList to mail attachments of foundMsg
+            set realAttCount to count of realAttList
+            repeat with i from 1 to realAttCount
+                try
+                    set anAtt to item i of realAttList
+                    set attName to name of anAtt
+                    set attSizeNum to (file size of anAtt)
+                    set attSize to attSizeNum as string
+                    set attMime to ""
+                    try
+                        set attMime to mime type of anAtt
+                    end try
+                    set end of attachLines to attName & "|||" & attSize & "|||" & attMime
+                end try
+            end repeat
+
+            set AppleScript's text item delimiters to linefeed
+            set attachStr to attachLines as string
+            set AppleScript's text item delimiters to ""
+
+            return "MSG_ID:" & msgNumId & linefeed & ¬
+                   "INTERNET_ID:" & msgInternetId & linefeed & ¬
+                   "SUBJECT:" & msgSubject & linefeed & ¬
+                   "FROM:" & msgSender & linefeed & ¬
+                   "TO:" & msgTo & linefeed & ¬
+                   "CC:" & msgCc & linefeed & ¬
+                   "REPLY_TO:" & msgReplyTo & linefeed & ¬
+                   "DATE_RECV:" & msgDateRecv & linefeed & ¬
+                   "DATE_SENT:" & msgDateSent & linefeed & ¬
+                   "IS_READ:" & msgRead & linefeed & ¬
+                   "IS_FLAGGED:" & msgFlagged & linefeed & ¬
+                   "MAILBOX:" & foundMailboxName & linefeed & ¬
+                   "ACCOUNT:" & foundAccountName & linefeed & ¬
+                   "ATTACH_COUNT:" & realAttCount & linefeed & ¬
+                   "ATTACHMENTS:" & attachStr & linefeed & ¬
+                   "BODY_START" & linefeed & msgBody & linefeed & "BODY_END"
+        end timeout
+    end tell
+    '''
+
+    try:
+        raw = run_applescript(script, timeout=60)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+    if raw.strip() == "NOT_FOUND":
+        return json.dumps({"error": "Email not found"})
+
+    result = _parse_get_email_output(raw)
+    resolved_id = result.get("message_id", "")
+    for i, att in enumerate(result.get("attachments", [])):
+        if resolved_id:
+            att["resource_uri"] = f"mail-attachment://{resolved_id}/{i}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _parse_get_email_output(raw: str) -> Dict[str, Any]:
+    """Parse the labelled output from the get_email AppleScript into a dict."""
+    lines = raw.splitlines()
+
+    record: Dict[str, Any] = {}
+    body_lines: List[str] = []
+    in_body = False
+    in_attachments = False
+    attach_lines: List[str] = []
+
+    for line in lines:
+        if in_body:
+            if line == "BODY_END":
+                in_body = False
+            else:
+                body_lines.append(line)
+            continue
+
+        if line == "BODY_START":
+            in_body = True
+            in_attachments = False
+            continue
+
+        if in_attachments:
+            if line:
+                attach_lines.append(line)
+            continue
+
+        if line.startswith("ATTACHMENTS:"):
+            in_attachments = True
+            first = line[len("ATTACHMENTS:"):].strip()
+            if first:
+                attach_lines.append(first)
+            continue
+
+        for prefix, key in [
+            ("MSG_ID:", "message_id"),
+            ("INTERNET_ID:", "internet_message_id"),
+            ("SUBJECT:", "subject"),
+            ("FROM:", "from"),
+            ("TO:", "to"),
+            ("CC:", "cc"),
+            ("REPLY_TO:", "reply_to"),
+            ("DATE_RECV:", "date_received"),
+            ("DATE_SENT:", "date_sent"),
+            ("IS_READ:", "is_read"),
+            ("IS_FLAGGED:", "is_flagged"),
+            ("MAILBOX:", "mailbox"),
+            ("ACCOUNT:", "account"),
+            ("ATTACH_COUNT:", "attachment_count"),
+        ]:
+            if line.startswith(prefix):
+                record[key] = line[len(prefix):]
+                break
+
+    record["is_read"] = record.get("is_read", "").lower() == "true"
+    record["is_flagged"] = record.get("is_flagged", "").lower() == "true"
+    try:
+        record["attachment_count"] = int(record.get("attachment_count", 0))
+    except ValueError:
+        record["attachment_count"] = 0
+
+    record["body"] = "\n".join(body_lines)
+
+    attachments = []
+    for att_line in attach_lines:
+        fields = att_line.split("|||")
+        if len(fields) >= 2:
+            try:
+                size = int(fields[1].strip())
+            except ValueError:
+                size = 0
+            name = fields[0].strip()
+            mime_type = fields[2].strip() if len(fields) >= 3 else ""
+            # AppleScript's mime type is often empty on Exchange/Outlook mail.
+            if not mime_type and name:
+                guessed, _ = mimetypes.guess_type(name)
+                mime_type = guessed or "application/octet-stream"
+            attachments.append(
+                {
+                    "name": name,
+                    "size_bytes": size,
+                    "mime_type": mime_type,
+                }
+            )
+    record["attachments"] = attachments
+
+    internet_mid = record.get("internet_message_id", "")
+    if internet_mid:
+        msg_id = internet_mid.strip("<>")
+        record["mail_link"] = f"message://%3C{quote(msg_id, safe='@')}%3E"
+
+    return record
+
+
+ATTACHMENT_RESOURCE_URI = "mail-attachment://{message_id}/{index}"
+
+
+@mcp.resource(ATTACHMENT_RESOURCE_URI, mime_type="application/octet-stream")
+def get_attachment_resource(
+    message_id: Union[str, int], index: Union[str, int]
+) -> bytes:
+    """Fetch the binary content of an email attachment.
+
+    URI: mail-attachment://{message_id}/{index}
+      message_id — Apple Mail numeric ID (from get_email or search_emails)
+      index      — 0-based attachment index (from get_email's attachments list)
+
+    The resource URIs are returned by get_email inside each attachment object
+    as the "resource_uri" field, so clients do not need to construct them manually.
+    """
+    message_id = str(message_id).strip()
+    if not message_id.isdigit():
+        raise ValueError(f"message_id must be numeric, got: {message_id!r}")
+
+    try:
+        idx = int(index)
+    except (ValueError, TypeError):
+        raise ValueError(f"index must be an integer, got: {index!r}")
+
+    if idx < 0:
+        raise ValueError(f"index must be >= 0, got: {idx}")
+
+    applescript_index = idx + 1  # AppleScript lists are 1-based
+
+    skip_folders = '{"Trash", "Junk", "Junk Email", "Deleted Items", "Sent", "Sent Items", "Sent Messages", "Drafts", "Spam", "Deleted Messages"}'
+
+    tmp_fd, tmp_path = tempfile.mkstemp()
+    os.close(tmp_fd)
+    escaped_tmp = escape_applescript(tmp_path)
+
+    script = f'''
+    tell application "Mail"
+        with timeout of 60 seconds
+            set foundMsg to missing value
+
+            repeat with targetAccount in every account
+                if foundMsg is not missing value then exit repeat
+                repeat with currentMailbox in every mailbox of targetAccount
+                    set mbName to name of currentMailbox
+                    if mbName is not in {skip_folders} then
+                        try
+                            set msgs to every message of currentMailbox whose id is {message_id}
+                            if (count of msgs) > 0 then
+                                set foundMsg to item 1 of msgs
+                                exit repeat
+                            end if
+                        end try
+                    end if
+                end repeat
+            end repeat
+
+            if foundMsg is missing value then
+                error "Email not found: " & {message_id}
+            end if
+
+            set atts to mail attachments of foundMsg
+            if {applescript_index} > (count of atts) then
+                error "Attachment index {idx} out of range (message has " & (count of atts) & " attachment(s))"
+            end if
+
+            save item {applescript_index} of atts in POSIX file "{escaped_tmp}"
+        end timeout
+    end tell
+    '''
+
+    try:
+        run_applescript(script, timeout=60)
+        with open(tmp_path, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
