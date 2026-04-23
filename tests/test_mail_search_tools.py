@@ -259,6 +259,65 @@ class SearchToolTests(unittest.TestCase):
         self.assertIn("on lowercase(str)", captured["script"])
         self.assertIn('lowerContent contains "invoice"', captured["script"])
 
+    def test_has_attachments_true_builds_post_filter_not_whose_clause(self):
+        # Mail's whose-filter engine can't evaluate `count of mail attachments`
+        # — attempting that produces 0 results. The fix applies has_attachments
+        # as a post-filter pass over the matched messages.
+        captured = {}
+
+        def fake_run(script, timeout=120):
+            captured["script"] = script
+            return ""
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            search_tools.search_emails(
+                account="Work",
+                has_attachments=True,
+                output_format="json",
+                limit=5,
+            )
+
+        script = captured["script"]
+        self.assertNotIn("(count of mail attachments) > 0", script)
+        self.assertNotIn("(count of mail attachments) = 0", script)
+        self.assertIn("(count of mail attachments of m) > 0", script)
+        self.assertIn("set matchingMessages to filteredMessages", script)
+
+    def test_has_attachments_false_uses_equality_operator_in_post_filter(self):
+        captured = {}
+
+        def fake_run(script, timeout=120):
+            captured["script"] = script
+            return ""
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            search_tools.search_emails(
+                account="Work",
+                has_attachments=False,
+                output_format="json",
+                limit=5,
+            )
+
+        script = captured["script"]
+        self.assertIn("(count of mail attachments of m) = 0", script)
+        self.assertIn("set matchingMessages to filteredMessages", script)
+
+    def test_has_attachments_none_emits_no_post_filter(self):
+        captured = {}
+
+        def fake_run(script, timeout=120):
+            captured["script"] = script
+            return ""
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            search_tools.search_emails(
+                account="Work",
+                output_format="json",
+                limit=5,
+            )
+
+        self.assertNotIn("filteredMessages", captured["script"])
+
 
 class ManageToolTests(unittest.TestCase):
     def test_update_email_status_with_message_ids_uses_exact_id_condition(self):
