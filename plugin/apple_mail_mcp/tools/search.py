@@ -162,18 +162,16 @@ def _search_mail_records(
     # When body_text is provided, we must iterate per-message (can't use whose clause)
     use_body_search = body_text is not None
 
-    # Build whose-clause filter conditions (only used when NOT doing body search)
+    # Build whose-clause filter conditions (only used when NOT doing body search).
+    # has_attachments is deliberately NOT included here: Mail's whose-filter engine
+    # cannot evaluate `count of <collection>` and silently yields an empty set.
+    # It is applied as a post-filter pass below.
     filter_conditions = []
     if not use_body_search:
         if subject_terms:
             filter_conditions.append(contains_any_condition("subject", subject_terms))
         if sender:
             filter_conditions.append(f'sender contains "{escaped_sender}"')
-        if has_attachments is not None:
-            if has_attachments:
-                filter_conditions.append("(count of mail attachments) > 0")
-            else:
-                filter_conditions.append("(count of mail attachments) = 0")
         if read_status == "read":
             filter_conditions.append("read status is true")
         elif read_status == "unread":
@@ -291,11 +289,33 @@ def _search_mail_records(
     else:
         body_search_loop = ""
 
+    # has_attachments post-filter: can't live in the whose-clause (Mail's filter
+    # engine won't evaluate `count of mail attachments` there). Run one pass over
+    # matchingMessages per mailbox to filter; body_search handles it inline.
+    if has_attachments is not None and not use_body_search:
+        attachment_op = ">" if has_attachments else "="
+        attachments_post_filter = f"""
+                            set filteredMessages to {{}}
+                            repeat with m in matchingMessages
+                                try
+                                    if (count of mail attachments of m) {attachment_op} 0 then
+                                        set end of filteredMessages to m
+                                    end if
+                                end try
+                            end repeat
+                            set matchingMessages to filteredMessages
+        """
+    else:
+        attachments_post_filter = ""
+
     # Choose the message collection strategy
     if use_body_search:
         message_collection = body_search_loop
     else:
-        message_collection = f"                            {matching_messages_script}"
+        message_collection = (
+            f"                            {matching_messages_script}"
+            f"{attachments_post_filter}"
+        )
 
     lowercase_handler = LOWERCASE_HANDLER if use_body_search else ""
 
