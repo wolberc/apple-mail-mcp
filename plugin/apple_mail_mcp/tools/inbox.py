@@ -2,6 +2,7 @@
 
 import json
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
@@ -15,7 +16,12 @@ from apple_mail_mcp.core import (
 
 
 def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
-    """Parse '|||'-delimited AppleScript output into a list of email dicts."""
+    """Parse '|||'-delimited AppleScript output into a list of email dicts.
+
+    Accepts 5-field legacy rows and 6/7-field rows that add message_id and
+    internet_message_id. When internet_message_id is present, a mail_link
+    deep-link is derived the same way search_emails does.
+    """
     emails = []
     if not raw:
         return emails
@@ -23,16 +29,27 @@ def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
         if "|||" not in line:
             continue
         parts = line.split("|||")
-        if len(parts) >= 5:
-            emails.append(
-                {
-                    "subject": parts[0].strip(),
-                    "sender": parts[1].strip(),
-                    "date": parts[2].strip(),
-                    "is_read": parts[3].strip().lower() == "true",
-                    "account": parts[4].strip(),
-                }
-            )
+        if len(parts) < 5:
+            continue
+        record: Dict[str, Any] = {
+            "subject": parts[0].strip(),
+            "sender": parts[1].strip(),
+            "date": parts[2].strip(),
+            "is_read": parts[3].strip().lower() == "true",
+            "account": parts[4].strip(),
+        }
+        if len(parts) >= 6:
+            record["message_id"] = parts[5].strip()
+        if len(parts) >= 7:
+            internet_mid = parts[6].strip()
+            record["internet_message_id"] = internet_mid
+            if internet_mid:
+                # Apple Mail deep link: message:// + percent-encoded angle brackets
+                # + raw @ in the Message-ID. Strip brackets first since AppleScript
+                # returns both forms depending on message source.
+                msg_id = internet_mid.strip("<>")
+                record["mail_link"] = f"message://%3C{quote(msg_id, safe='@')}%3E"
+        emails.append(record)
     return emails
 
 
@@ -209,7 +226,12 @@ def _list_inbox_emails_json(
                         set messageSender to sender of aMessage
                         set messageDate to date received of aMessage
                         set messageRead to read status of aMessage
-                        set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName
+                        set messageNumId to id of aMessage as string
+                        set internetMid to ""
+                        try
+                            set internetMid to message id of aMessage
+                        end try
+                        set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messageNumId & "|||" & internetMid
                     end try
                 end repeat
             end try
