@@ -1,7 +1,40 @@
 """Core helpers: AppleScript execution, escaping, parsing, and preference injection."""
 
 import subprocess
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
+
+
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def build_applescript_date(
+    var_name: str, date_value: Optional[str], end_of_day: bool = False
+) -> str:
+    """Build AppleScript snippet to set *var_name* to a date from an ISO string (YYYY-MM-DD).
+
+    Pass end_of_day=True to set time to 23:59:59 (useful for inclusive upper bounds).
+    Returns an empty string when date_value is None so callers can always concatenate safely.
+    """
+    if not date_value:
+        return ""
+    try:
+        parsed = datetime.strptime(date_value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"Invalid date '{date_value}'. Use YYYY-MM-DD")
+
+    month_name = MONTH_NAMES[parsed.month - 1]
+    seconds = 86399 if end_of_day else 0
+    return f"""
+                set {var_name} to current date
+                set year of {var_name} to {parsed.year}
+                set month of {var_name} to {month_name}
+                set day of {var_name} to {parsed.day}
+                set time of {var_name} to {seconds}
+    """
 
 from apple_mail_mcp.server import USER_PREFERENCES
 

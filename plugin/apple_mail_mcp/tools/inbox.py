@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
+    build_applescript_date,
     inject_preferences,
     escape_applescript,
     run_applescript,
@@ -22,16 +23,25 @@ def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
         if "|||" not in line:
             continue
         parts = line.split("|||")
-        if len(parts) >= 5:
-            emails.append(
-                {
-                    "subject": parts[0].strip(),
-                    "sender": parts[1].strip(),
-                    "date": parts[2].strip(),
-                    "is_read": parts[3].strip().lower() == "true",
-                    "account": parts[4].strip(),
-                }
-            )
+        if len(parts) < 5:
+            continue
+        record: Dict[str, Any] = {
+            "subject": parts[0].strip(),
+            "sender": parts[1].strip(),
+            "date": parts[2].strip(),
+            "is_read": parts[3].strip().lower() == "true",
+            "account": parts[4].strip(),
+        }
+        if len(parts) >= 6:
+            record["message_id"] = parts[5].strip()
+        if len(parts) >= 7:
+            internet_mid = parts[6].strip()
+            record["internet_message_id"] = internet_mid
+            if internet_mid:
+                from urllib.parse import quote
+                msg_id = internet_mid.strip("<>")
+                record["mail_link"] = f"message://%3C{quote(msg_id, safe='@')}%3E"
+        emails.append(record)
     return emails
 
 
@@ -43,6 +53,8 @@ def list_inbox_emails(
     include_read: bool = True,
     include_content: bool = False,
     output_format: str = "text",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> str:
     """
     List all emails from inbox across all accounts or a specific account.
@@ -56,26 +68,51 @@ def list_inbox_emails(
         include_read: Whether to include read emails (default: True)
         include_content: Whether to include a content preview for each email (slower, default: False)
         output_format: "text" (default, human-readable) or "json" (structured list of email dicts)
+        date_from: Only include emails on or after this date, ISO format YYYY-MM-DD (e.g. "2024-01-15").
+                   Applied as a pre-scan filter to avoid timeouts on large mailboxes.
+        date_to: Only include emails on or before this date, ISO format YYYY-MM-DD (e.g. "2024-01-15").
+                 Applied as a pre-scan filter to avoid timeouts on large mailboxes.
 
     Returns:
         Formatted list of emails with subject, sender, date, and read status
     """
 
     if output_format == "json":
-        return _list_inbox_emails_json(account, max_emails, include_read, include_content)
+        return _list_inbox_emails_json(account, max_emails, include_read, include_content, date_from, date_to)
+
+    # Build date variables and whose-clause pre-filter (applied by Mail before iterating)
+    date_setup = build_applescript_date("fromDate", date_from)
+    date_setup += build_applescript_date("toDate", date_to, end_of_day=True)
+
+    filter_conditions = []
+    if not include_read:
+        filter_conditions.append("read status is false")
+    if date_from:
+        filter_conditions.append("date received >= fromDate")
+    if date_to:
+        filter_conditions.append("date received <= toDate")
+
+    if filter_conditions:
+        message_fetch = f"set inboxMessages to every message of inboxMailbox whose {' and '.join(filter_conditions)}"
+    else:
+        message_fetch = "set inboxMessages to every message of inboxMailbox"
+
+    account_open = f'if accountName is "{escape_applescript(account)}" then' if account else ""
+    account_close = "end if" if account else ""
 
     script = f"""
     tell application "Mail"
         set outputText to "INBOX EMAILS - ALL ACCOUNTS" & return & return
         set totalCount to 0
         set allAccounts to every account
+        {date_setup}
 
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
-
+            {account_open}
             try
                 {inbox_mailbox_script("inboxMailbox", "anAccount")}
-                set inboxMessages to every message of inboxMailbox
+                {message_fetch}
                 set messageCount to count of inboxMessages
 
                 if messageCount > 0 then
@@ -94,28 +131,21 @@ def list_inbox_emails(
                             set messageDate to date received of aMessage
                             set messageRead to read status of aMessage
 
-                            set shouldInclude to true
-                            if not {str(include_read).lower()} and messageRead then
-                                set shouldInclude to false
+                            if messageRead then
+                                set readIndicator to "✓"
+                            else
+                                set readIndicator to "✉"
                             end if
 
-                            if shouldInclude then
-                                if messageRead then
-                                    set readIndicator to "✓"
-                                else
-                                    set readIndicator to "✉"
-                                end if
+                            set outputText to outputText & readIndicator & " " & messageSubject & return
+                            set outputText to outputText & "   From: " & messageSender & return
+                            set outputText to outputText & "   Date: " & (messageDate as string) & return
 
-                                set outputText to outputText & readIndicator & " " & messageSubject & return
-                                set outputText to outputText & "   From: " & messageSender & return
-                                set outputText to outputText & "   Date: " & (messageDate as string) & return
+                            {content_preview_script(200) if include_content else ""}
 
-                                {content_preview_script(200) if include_content else ""}
+                            set outputText to outputText & return
 
-                                set outputText to outputText & return
-
-                                set totalCount to totalCount + 1
-                            end if
+                            set totalCount to totalCount + 1
                         end try
                     end repeat
                 end if
@@ -123,6 +153,7 @@ def list_inbox_emails(
                 set outputText to outputText & "⚠ Error accessing inbox for account " & accountName & return
                 set outputText to outputText & "   " & errMsg & return & return
             end try
+            {account_close}
         end repeat
 
         set outputText to outputText & "========================================" & return
@@ -142,22 +173,41 @@ def _list_inbox_emails_json(
     max_emails: int,
     include_read: bool,
     include_content: bool = False,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> str:
     """Return inbox emails as a JSON string."""
     escaped_account = escape_applescript(account) if account else None
     account_filter = f'if accountName is "{escaped_account}" then' if account else ""
     account_filter_end = "end if" if account else ""
 
+    date_setup = build_applescript_date("fromDate", date_from)
+    date_setup += build_applescript_date("toDate", date_to, end_of_day=True)
+
+    filter_conditions = []
+    if not include_read:
+        filter_conditions.append("read status is false")
+    if date_from:
+        filter_conditions.append("date received >= fromDate")
+    if date_to:
+        filter_conditions.append("date received <= toDate")
+
+    if filter_conditions:
+        message_fetch = f"set inboxMessages to every message of inboxMailbox whose {' and '.join(filter_conditions)}"
+    else:
+        message_fetch = "set inboxMessages to every message of inboxMailbox"
+
     script = f"""
     tell application "Mail"
         set resultLines to {{}}
         set allAccounts to every account
+        {date_setup}
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
             {account_filter}
             try
                 {inbox_mailbox_script("inboxMailbox", "anAccount")}
-                set inboxMessages to every message of inboxMailbox
+                {message_fetch}
                 set currentIndex to 0
                 repeat with aMessage in inboxMessages
                     set currentIndex to currentIndex + 1
@@ -167,13 +217,12 @@ def _list_inbox_emails_json(
                         set messageSender to sender of aMessage
                         set messageDate to date received of aMessage
                         set messageRead to read status of aMessage
-                        set shouldInclude to true
-                        if not {str(include_read).lower()} and messageRead then
-                            set shouldInclude to false
-                        end if
-                        if shouldInclude then
-                            set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName
-                        end if
+                        set messageNumId to id of aMessage as string
+                        set internetMid to ""
+                        try
+                            set internetMid to message id of aMessage
+                        end try
+                        set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messageNumId & "|||" & internetMid
                     end try
                 end repeat
             end try
