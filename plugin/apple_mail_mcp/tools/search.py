@@ -2,12 +2,12 @@
 
 import json
 import re
-from datetime import datetime
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
+    build_applescript_date,
     contains_any_condition,
     inject_preferences,
     escape_applescript,
@@ -15,45 +15,6 @@ from apple_mail_mcp.core import (
     run_applescript,
     LOWERCASE_HANDLER,
 )
-
-
-MONTH_NAMES = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
-
-
-def _build_applescript_date(
-    var_name: str, date_value: Optional[str], end_of_day: bool = False
-) -> str:
-    """Build AppleScript to create a date from an ISO day string."""
-    if not date_value:
-        return ""
-
-    try:
-        parsed_date = datetime.strptime(date_value, "%Y-%m-%d")
-    except ValueError:
-        raise ValueError(f"Invalid date '{date_value}'. Use YYYY-MM-DD")
-
-    month_name = MONTH_NAMES[parsed_date.month - 1]
-    seconds = 86399 if end_of_day else 0
-    return f"""
-                set {var_name} to current date
-                set year of {var_name} to {parsed_date.year}
-                set month of {var_name} to {month_name}
-                set day of {var_name} to {parsed_date.day}
-                set time of {var_name} to {seconds}
-    """
 
 
 def _parse_search_records(output: str) -> List[Dict[str, Any]]:
@@ -255,8 +216,8 @@ def _search_mail_records(
         '''
         skip_script = ""
 
-    date_setup = _build_applescript_date("fromDate", date_from)
-    date_setup += _build_applescript_date("toDate", date_to, end_of_day=True)
+    date_setup = build_applescript_date("fromDate", date_from)
+    date_setup += build_applescript_date("toDate", date_to, end_of_day=True)
 
     # Build account iteration
     if account:
