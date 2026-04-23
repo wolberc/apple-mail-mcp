@@ -52,23 +52,29 @@ def _sanitize_for_json(text: str) -> str:
 
 def run_applescript(script: str, timeout: int = 120) -> str:
     """Execute AppleScript via stdin pipe for reliable multi-line handling."""
+    proc = subprocess.Popen(
+        ["osascript", "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     try:
-        result = subprocess.run(
-            ["osascript", "-"],
-            input=script.encode("utf-8"),
-            capture_output=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            if stderr:
-                raise Exception(f"AppleScript error: {stderr}")
-        output = result.stdout.decode("utf-8", errors="replace").strip()
-        return _sanitize_for_json(output)
+        stdout, stderr = proc.communicate(input=script.encode("utf-8"), timeout=timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()  # drain pipes so the process exits cleanly
         raise Exception("AppleScript execution timed out")
     except Exception as e:
+        proc.kill()
+        proc.communicate()
         raise Exception(f"AppleScript execution failed: {str(e)}")
+
+    if proc.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            raise Exception(f"AppleScript error: {stderr_text}")
+    output = stdout.decode("utf-8", errors="replace").strip()
+    return _sanitize_for_json(output)
 
 
 def normalize_search_terms(

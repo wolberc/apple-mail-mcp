@@ -119,7 +119,7 @@ def move_email(
 
     script = f'''
     tell application "Mail"
-        with timeout of 300 seconds
+        with timeout of 270 seconds
             set outputText to "{mode_label}: {safe_from} -> {safe_to}" & return & return
             set moveCount to 0
 
@@ -353,7 +353,7 @@ def update_email_status(
 
         script = f'''
         tell application "Mail"
-            with timeout of 300 seconds
+            with timeout of 270 seconds
                 set outputText to "UPDATING EMAIL STATUS BY IDS: {action_label}" & return & return
                 set updateCount to 0
 
@@ -444,7 +444,7 @@ def update_email_status(
 
     script = f'''
     tell application "Mail"
-        with timeout of 300 seconds
+        with timeout of 270 seconds
             set outputText to "UPDATING EMAIL STATUS: {action_label}" & return & return
             set updateCount to 0
 
@@ -601,7 +601,7 @@ def manage_trash(
 
         script = f'''
         tell application "Mail"
-            with timeout of 300 seconds
+            with timeout of 270 seconds
                 set outputText to "PERMANENTLY DELETING EMAILS" & return & return
                 set deleteCount to 0
 
@@ -692,7 +692,7 @@ def manage_trash(
 
         script = f'''
         tell application "Mail"
-            with timeout of 300 seconds
+            with timeout of 270 seconds
                 set outputText to "{mode_label}" & return & return
                 set deleteCount to 0
 
