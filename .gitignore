@@ -46,3 +46,4 @@ archive/
 
 # Personal configuration examples (keep templates only)
 claude_desktop_config.json
+uv.lock
