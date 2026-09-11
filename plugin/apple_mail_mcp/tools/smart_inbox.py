@@ -6,6 +6,7 @@ from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
+    build_applescript_date,
     run_applescript,
     inbox_mailbox_script,
     date_cutoff_script,
@@ -224,6 +225,7 @@ def get_needs_response(
     mailbox: str = "INBOX",
     days_back: int = 7,
     max_results: int = 20,
+    date_from: Optional[str] = None,
 ) -> str:
     """Identify unread emails that likely need a response from you.
 
@@ -234,8 +236,11 @@ def get_needs_response(
     Args:
         account: Account name (e.g., "Gmail", "Work", "Personal")
         mailbox: Mailbox to scan (default: "INBOX")
-        days_back: How many days back to look (default: 7)
+        days_back: How many days back to look (default: 7, 0 = no date bound)
         max_results: Maximum results to return (default: 20)
+        date_from: Only consider emails on or after this date, ISO format YYYY-MM-DD
+                   (e.g. "2024-01-15"). Overrides days_back. Applied as a pre-scan
+                   filter to avoid timeouts on large mailboxes.
 
     Returns:
         Ranked list of emails likely needing a response, with priority hints
@@ -245,13 +250,34 @@ def get_needs_response(
 
     newsletter_condition = _newsletter_filter_condition("lowerSender")
 
+    # Pre-scan filter: Mail evaluates these before handing us message refs, so we
+    # never enumerate the whole mailbox. Without it the heuristic times out at
+    # inbox scale. date_from wins over days_back when both are supplied.
+    date_setup = build_applescript_date("fromDate", date_from)
+    prescan_conditions = ["read status is false"]
+    if date_from:
+        prescan_conditions.append("date received >= fromDate")
+    elif days_back > 0:
+        prescan_conditions.append("date received >= cutoffDate")
+    message_fetch = (
+        "set mailboxMessages to every message of targetMailbox whose "
+        + " and ".join(prescan_conditions)
+    )
+    if date_from:
+        window_label = f"Since {escape_applescript(date_from)}"
+    elif days_back > 0:
+        window_label = f"Last {days_back} days"
+    else:
+        window_label = "All time"
+
     script = f'''
     tell application "Mail"
         set outputText to "EMAILS NEEDING RESPONSE" & return
-        set outputText to outputText & "Account: {escaped_account} | Mailbox: {escaped_mailbox} | Last {days_back} days" & return
+        set outputText to outputText & "Account: {escaped_account} | Mailbox: {escaped_mailbox} | {window_label}" & return
         set outputText to outputText & "========================================" & return & return
 
         {date_cutoff_script(days_back, "cutoffDate")}
+        {date_setup}
 
         try
             set targetAccount to account "{escaped_account}"
@@ -296,8 +322,8 @@ def get_needs_response(
                 end repeat
             end if
 
-            -- Scan target mailbox
-            set mailboxMessages to every message of targetMailbox
+            -- Scan target mailbox (date + unread bound applied by Mail, not by us)
+            {message_fetch}
             set highPriority to {{}}
             set normalPriority to {{}}
             set totalChecked to 0
@@ -307,7 +333,6 @@ def get_needs_response(
 
                 try
                     set messageDate to date received of aMessage
-                    {"if messageDate < cutoffDate then exit repeat" if days_back > 0 else ""}
 
                     -- Only look at unread emails
                     if not (read status of aMessage) then
